@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+cdk.out/
+cdk.context.json
+node_modules/
+*.egg-info/
+build/
+dist/
+/datasets/
+/outputs/
+/workshop/
+*.tgz
+*.log
+outputs.json

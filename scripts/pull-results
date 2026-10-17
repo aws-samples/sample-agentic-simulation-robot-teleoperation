@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Pull a published dataset and/or run logs from the exchange bucket to this machine.
+#
+#   scripts/pull-results                              # list what is in the bucket
+#   scripts/pull-results agent_vials_to_rack          # datasets/<name>/ -> ./outputs/datasets/<name>/
+#   scripts/pull-results agent_vials_to_rack ep1-*    # ... plus matching runs/ prefixes
+set -euo pipefail
+cd "$(dirname "$0")/.."
+STACK=${SIMTELEOP_STACK:-SimTeleopPlatform}
+BUCKET=${SIMTELEOP_BUCKET:-$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='ExchangeBucketName'].OutputValue" --output text 2>/dev/null || true)}
+[ -n "$BUCKET" ] && [ "$BUCKET" != None ] || { echo "no bucket: stack '$STACK' not found; set SIMTELEOP_STACK or SIMTELEOP_BUCKET" >&2; exit 2; }
+if [ $# -eq 0 ]; then
+    echo "datasets:"; aws s3 ls "s3://$BUCKET/datasets/" | sed 's/^/  /'
+    echo "runs:"; aws s3 ls "s3://$BUCKET/runs/" | sed 's/^/  /'
+    exit 0
+fi
+mkdir -p outputs/datasets outputs/runs
+# --exact-timestamps: meta/info.json is rewritten with the same byte size after every episode and the
+# default size+mtime comparison skipped it (measured 2026-10-08: a stale 1-episode info.json next to
+# a 2-episode parquet).
+aws s3 sync --only-show-errors --exact-timestamps "s3://$BUCKET/datasets/$1/" "outputs/datasets/$1/"
+echo "outputs/datasets/$1/ ($(find "outputs/datasets/$1" -name '*.mp4' | wc -l) videos, $(ls "outputs/datasets/$1/manifests" 2>/dev/null | wc -l) manifests)"
+if [ -n "${2:-}" ]; then
+    for p in $(aws s3 ls "s3://$BUCKET/runs/" | awk '{print $2}' | grep -E "^${2//\*/.*}" || true); do
+        aws s3 sync --only-show-errors --exact-timestamps "s3://$BUCKET/runs/$p" "outputs/runs/$p"; echo "outputs/runs/$p"
+    done
+fi

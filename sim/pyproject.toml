@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simteleop-sim"
+version = "0.1.0"
+description = "Env server exposing the NVIDIA SO-101 workshop tasks to an agent over TCP"
+requires-python = ">=3.10"
+# Isaac Lab, torch, gymnasium and sim_to_real_so101 come from the workshop container; only what is
+# not already there is listed.
+dependencies = ["simteleop-common", "numpy", "Pillow"]
+
+[tool.setuptools.packages.find]
+include = ["simteleop_sim*"]

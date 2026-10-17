@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Run a command on the platform's EC2 box from your workstation, over SSM (no SSH, no inbound rule).
+#
+#   scripts/remote simteleop-status                       # run, wait, print the output
+#   scripts/remote bash -c 'cmd1; cmd2 | grep x'           # pipes, ";" and redirections need an explicit shell
+#   scripts/remote --detach ep1 simteleop-agent --episodes 5 --out /home/ubuntu/simteleop/runs/ep1
+#   scripts/remote --log ep1                              # tail the log of a detached job
+#   scripts/remote --wait ep1                             # block until a detached job finishes, then print its log tail
+#   scripts/remote --start | --stop                       # start / stop the instance (billing!)
+#   scripts/remote --outputs                              # the stack's outputs (instance id, DCV URL, bucket)
+#
+# Needs the AWS CLI with credentials for the account the stack is in (and the region: AWS_REGION or
+# the CLI default). SIMTELEOP_STACK overrides the stack name (default SimTeleopPlatform);
+# SIMTELEOP_INSTANCE=i-... targets a box that was not created by the stack.
+#
+# Why detach: SSM's RunShellScript kills its process tree when the command returns or times out, and
+# an agent batch runs for hours. --detach wraps the command in a transient systemd unit (as ubuntu,
+# in /home/ubuntu/simteleop) that outlives the SSM call and logs to /var/log/simteleop-<name>.log.
+set -euo pipefail
+
+STACK=${SIMTELEOP_STACK:-SimTeleopPlatform}
+
+outputs() {
+    aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].Outputs' --output json 2>/dev/null \
+        || { echo "stack '$STACK' not found in this account/region: set SIMTELEOP_STACK, or SIMTELEOP_INSTANCE=i-... (and SIMTELEOP_BUCKET) to bypass" >&2; exit 2; }
+}
+output() { local o; o=$(outputs) || exit 2; echo "$o" | python3 -c "import json,sys; o={x['OutputKey']:x['OutputValue'] for x in json.load(sys.stdin)}; print(o['$1'])"; }
+
+INSTANCE=${SIMTELEOP_INSTANCE:-}
+instance() { [ -n "$INSTANCE" ] || INSTANCE=$(output InstanceId) || exit 2; echo "$INSTANCE"; }
+case "${1:-}" in ""|-h|--help|--outputs) ;; *) instance >/dev/null ;; esac  # resolve (or fail) once, up front
+
+# Send one bash script to the box and print its output when it finishes. SSM runs its commands under
+# /bin/sh, so the script travels base64-encoded and is handed to bash on the box (quotes, newlines
+# and bash quoting from printf %q all survive).
+ssm_run() {  # ssm_run <timeout_s> <bash script>
+    local timeout=$1 b64 id status
+    b64=$(printf '%s' "$2" | base64 -w0)
+    id=$(aws ssm send-command --instance-ids "$(instance)" --document-name AWS-RunShellScript \
+        --parameters "{\"commands\":[\"echo $b64 | base64 -d | bash\"]}" \
+        --timeout-seconds "$timeout" --query 'Command.CommandId' --output text)
+    while :; do
+        sleep 3
+        status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$(instance)" --query Status --output text 2>/dev/null || echo Pending)
+        case "$status" in Pending|InProgress|Delayed) ;; *) break ;; esac
+    done
+    aws ssm get-command-invocation --command-id "$id" --instance-id "$(instance)" --query '[StandardOutputContent,StandardErrorContent]' --output text
+    [ "$status" = Success ]
+}
+
+# The environment the operator commands expect (/etc/simteleop.env), exported.
+ENV_PRELUDE='cd /home/ubuntu/simteleop 2>/dev/null; set -a; . /etc/simteleop.env 2>/dev/null; set +a'
+
+wait_online() {
+    local s
+    for _ in $(seq 1 60); do
+        s=$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$(instance)" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
+        [ "$s" = Online ] && return 0
+        sleep 10
+    done
+    echo "instance not reachable over SSM after 10 min" >&2; return 1
+}
+
+case "${1:-}" in
+    --outputs) o=$(outputs) && echo "$o" | python3 -c "import json,sys; [print(f\"{x['OutputKey']:22} {x['OutputValue']}\") for x in json.load(sys.stdin)]" ;;
+    --start)
+        aws ec2 start-instances --instance-ids "$(instance)" --query 'StartingInstances[].CurrentState.Name' --output text
+        wait_online && echo "online" ;;
+    --stop)
+        aws ec2 stop-instances --instance-ids "$(instance)" --query 'StoppingInstances[].CurrentState.Name' --output text ;;
+    --detach)
+        name=$2; shift 2
+        cmd=$(printf '%q ' "$@")
+        ssm_run 60 "systemctl reset-failed simteleop-$name 2>/dev/null; rm -f /var/log/simteleop-$name.log
+systemd-run --unit simteleop-$name --collect --uid ubuntu -p WorkingDirectory=/home/ubuntu/simteleop \
+  -p StandardOutput=append:/var/log/simteleop-$name.log -p StandardError=append:/var/log/simteleop-$name.log \
+  bash -c $(printf '%q' "$ENV_PRELUDE; $cmd") && echo \"started simteleop-$name (log: scripts/remote --log $name)\"" ;;
+    --log)
+        ssm_run 60 "systemctl is-active simteleop-$2 || true; tail -n ${3:-40} /var/log/simteleop-$2.log" ;;
+    --wait)
+        name=$2
+        while :; do
+            st=$(ssm_run 60 "systemctl is-active simteleop-$name || true" | head -1)
+            case "$st" in active|activating) sleep 30 ;; *) break ;; esac
+        done
+        ssm_run 60 "tail -n ${3:-40} /var/log/simteleop-$name.log" ;;
+    ""|-h|--help) sed -n '2,16p' "$0" ;;
+    *)
+        cmd=$(printf '%q ' "$@")
+        ssm_run "${SIMTELEOP_TIMEOUT:-600}" "$ENV_PRELUDE; $cmd" ;;
+esac

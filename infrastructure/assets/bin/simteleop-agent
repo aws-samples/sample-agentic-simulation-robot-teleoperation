@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run the agent operator (host venv, instance-role credentials).
+#   simteleop-agent --check
+#   simteleop-agent "put a vial in the rack"
+#   simteleop-agent --episodes 10 --out /home/ubuntu/simteleop/runs/batch1
+set -eo pipefail
+# shellcheck disable=SC1091
+. /etc/simteleop.env
+export AWS_REGION AWS_DEFAULT_REGION SIMTELEOP_AGENT_MODEL
+exec /home/ubuntu/simteleop/agent-venv/bin/python -m simteleop_agent "$@"

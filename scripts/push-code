@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Push this checkout's code to a running box and restart the env server, without a redeploy.
+#
+#   scripts/push-code              # common/ sim/ agent/ docs/ + infrastructure/assets/{bin,bootstrap} -> s3://<bucket>/code/ -> /opt/simteleop/code
+#   scripts/push-code --no-restart # upload and install only
+#
+# The box runs the sim package from /opt/simteleop/code (simteleop-up mounts it over the image's copy),
+# so sim/common changes take effect on the next simteleop-up; the agent package is reinstalled into
+# its venv here. The simulator image itself is rebuilt only by `sudo simteleop-build-image` (FORCE=1).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+STACK=${SIMTELEOP_STACK:-SimTeleopPlatform}
+BUCKET=${SIMTELEOP_BUCKET:-$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='ExchangeBucketName'].OutputValue" --output text 2>/dev/null || true)}
+[ -n "$BUCKET" ] && [ "$BUCKET" != None ] || { echo "no bucket: stack '$STACK' not found; set SIMTELEOP_STACK or SIMTELEOP_BUCKET" >&2; exit 2; }
+EXCL=(--exclude '*__pycache__*' --exclude '*.pyc' --exclude '*.egg-info*' --exclude '*/build/*' --exclude '*/.venv/*' --exclude '*/.pytest_cache/*')
+
+for d in common sim agent docs; do aws s3 sync --only-show-errors "${EXCL[@]}" "$d" "s3://$BUCKET/code/$d/"; done
+aws s3 sync --only-show-errors infrastructure/assets/bin "s3://$BUCKET/code/bin/"
+aws s3 sync --only-show-errors infrastructure/assets/bootstrap "s3://$BUCKET/code/bootstrap/"
+echo "uploaded to s3://$BUCKET/code/"
+
+RESTART='simteleop-down >/dev/null 2>&1 || true; sleep 2; systemctl reset-failed simteleop-up 2>/dev/null; rm -f /var/log/simteleop-up.log; systemd-run --unit simteleop-up --collect -p StandardOutput=append:/var/log/simteleop-up.log -p StandardError=append:/var/log/simteleop-up.log /usr/local/bin/simteleop-up >/dev/null; for i in $(seq 1 40); do sleep 5; simteleop-status 2>/dev/null | grep -q "env server: task" && break; done; simteleop-status 2>&1 | head -3'
+[ "${1:-}" = --no-restart ] && RESTART='echo "not restarted; run simteleop-up on the box"'
+
+SIMTELEOP_TIMEOUT=900 "$(dirname "$0")/remote" bash -c "
+set -e
+sudo aws s3 sync --only-show-errors --delete --exclude '*__pycache__*' s3://$BUCKET/code/common/ /opt/simteleop/code/common/
+sudo aws s3 sync --only-show-errors --delete --exclude '*__pycache__*' s3://$BUCKET/code/sim/ /opt/simteleop/code/sim/
+sudo aws s3 sync --only-show-errors --delete --exclude '*__pycache__*' s3://$BUCKET/code/agent/ /opt/simteleop/code/agent/
+sudo aws s3 sync --only-show-errors s3://$BUCKET/code/docs/ /opt/simteleop/code/docs/
+sudo aws s3 sync --only-show-errors s3://$BUCKET/code/bin/ /opt/simteleop/code/bin/
+sudo aws s3 sync --only-show-errors s3://$BUCKET/code/bootstrap/ /opt/simteleop/code/bootstrap/
+sudo chmod +x /opt/simteleop/code/bootstrap/*.sh /opt/simteleop/code/bin/*
+sudo bash /opt/simteleop/code/bootstrap/40_operator_commands.sh >/dev/null 2>&1
+# setuptools writes *.egg-info into the source tree and /opt/simteleop/code is root-owned (the bootstrap
+# has the same problem and the same fix): install from an ubuntu-owned copy, and fail the push if the
+# import does not work afterwards
+SRC=\$(mktemp -d /tmp/simteleop-src.XXXX); sudo cp -r /opt/simteleop/code/common /opt/simteleop/code/agent \$SRC/ && sudo chown -R ubuntu:ubuntu \$SRC
+sudo -u ubuntu /home/ubuntu/simteleop/agent-venv/bin/pip install -q --no-deps \$SRC/common \$SRC/agent 2>&1 | grep -vE 'notice|WARNING' || true
+sudo rm -rf \$SRC
+/home/ubuntu/simteleop/agent-venv/bin/python -c 'import simteleop_common.solution, simteleop_agent' || { echo 'INSTALL FAILED on the box'; exit 1; }
+echo 'installed on the box'
+sudo bash -c '$RESTART'
+"

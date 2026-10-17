@@ -1,0 +1,8 @@
+{
+  "solution": {
+    "_comment": "AWS Solution identity: the single source of truth for both reporting mechanisms, the CloudFormation stack Description (deployment counting) and the AWS SDK User-Agent suffix (API usage attribution). Not a per-run knob: bump 'version' when cutting a release and otherwise leave it alone. solution.py next to this file is the only reader and always reads THIS file; it ships inside the simteleop_common package so the agent on the instance reads the same values as the CDK app. See solution.py for the exact formats and the README section 'Usage reporting' for what is and is not collected.",
+    "id": "SO0375",
+    "name": "Simulation Robot Teleoperation Platform",
+    "version": "v1.0.0"
+  }
+}

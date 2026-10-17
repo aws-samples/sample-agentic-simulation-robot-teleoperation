@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Start the simulator container and the env server on a workshop task.
+#   simteleop-up                       headless, Lerobot-So101-Teleop-Vials-To-Rack, recording enabled
+#   simteleop-up --gui                 with the Isaac Sim window on the DCV desktop (slower rendering)
+#   simteleop-up --task Lerobot-So101-Teleop-Vials-To-Rack-DR --dataset agent_vials_dr
+#   simteleop-up --no-record
+#   simteleop-up --image-code          run the code baked into the image (default: /opt/simteleop/code mounted over it)
+set -eo pipefail
+# shellcheck disable=SC1091
+. /etc/simteleop.env
+TASK=Lerobot-So101-Teleop-Vials-To-Rack
+DATASET=agent_vials_to_rack
+# DEV=1: mount the sources from /opt/simteleop/code over the image's copy, so the box runs the code
+# that was synced to it (the image is only rebuilt by simteleop-build-image; on 2026-10-07 it was 8
+# commits behind and its reset crashed). --image-code runs the baked copy instead.
+GUI=0; RECORD=1; SEED=101; DEV=1
+while [ $# -gt 0 ]; do
+    case $1 in
+        --gui) GUI=1 ;;
+        --task) TASK=$2; shift ;;
+        --dataset) DATASET=$2; shift ;;
+        --no-record) RECORD=0 ;;
+        --seed) SEED=$2; shift ;;
+        --dev) DEV=1 ;;
+        --image-code) DEV=0 ;;
+        *) echo "unknown option $1"; exit 2 ;;
+    esac; shift
+done
+say () { echo "[simteleop-up] $*"; }
+WS=/home/ubuntu/simteleop/workshop
+IMG=${SIMTELEOP_SIM_IMAGE:-simteleop-sim:workshop-${SIMTELEOP_WORKSHOP_COMMIT:0:8}}
+docker image inspect "$IMG" >/dev/null 2>&1 || { say "image $IMG missing -- run: sudo simteleop-build-image"; exit 2; }
+
+say "stopping a previous sim container, if any"
+docker rm -f simteleop_sim >/dev/null 2>&1 || true
+
+DISP_ARGS=(); HEADLESS_FLAG=--headless
+if [ "$GUI" = 1 ]; then
+    simteleop-fix-display >/dev/null 2>&1 || say "warning: could not fix DCV xauth permissions"
+    DISP=""; for s in /tmp/.X11-unix/X*; do [ -S "$s" ] && { DISP=":${s##*/X}"; break; }; done
+    XAUTH=/run/user/1000/dcv/${DCV_SESSION:-simteleop}.xauth
+    if [ -n "$DISP" ] && [ -r "$XAUTH" ]; then
+        # The container runs as root and shares the host's network namespace + hostname, so the
+        # DCV cookie works as-is once the file is readable.
+        DISP_ARGS=(-e DISPLAY="$DISP" -e XAUTHORITY=/root/.Xauthority -v "$XAUTH:/root/.Xauthority:ro" -v /tmp/.X11-unix:/tmp/.X11-unix)
+        HEADLESS_FLAG=""
+        say "GUI on display $DISP"
+    else
+        say "no DCV display/xauth found; starting headless"
+    fi
+fi
+
+DEV_ARGS=()
+if [ "$DEV" = 1 ]; then
+    SP=/workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages
+    DEV_ARGS=(-v /opt/simteleop/code/common/simteleop_common:$SP/simteleop_common:ro -v /opt/simteleop/code/sim/simteleop_sim:$SP/simteleop_sim:ro)
+    say "dev mode: source from /opt/simteleop/code mounted over the installed packages"
+fi
+REC_ARGS=()
+if [ "$RECORD" = 1 ]; then
+    REC_ARGS=(--dataset-root "/workspace/datasets/$DATASET" --repo-id "local/$DATASET")
+fi
+mkdir -p /home/ubuntu/simteleop/cache/{kit,ov,pip,glcache,computecache} /home/ubuntu/simteleop/datasets
+
+say "starting $IMG on $TASK ($([ -n "$HEADLESS_FLAG" ] && echo headless || echo GUI); recording $([ "$RECORD" = 1 ] && echo "to datasets/$DATASET" || echo off))"
+docker run -d --name simteleop_sim --gpus all --network host --shm-size 16g \
+    -e ACCEPT_EULA=Y -e PRIVACY_CONSENT=Y -e SIMTELEOP_TOOL_AXIS="${SIMTELEOP_TOOL_AXIS:--z}" \
+    -e SIMTELEOP_GRASP_TILT_DEG="${SIMTELEOP_GRASP_TILT_DEG:-35}" -e SIMTELEOP_TCP_OFFSET="${SIMTELEOP_TCP_OFFSET:-0.01,0.01,-0.09}" \
+    "${DISP_ARGS[@]}" "${DEV_ARGS[@]}" \
+    -v /home/ubuntu/simteleop/cache/kit:/isaac-sim/kit/cache:rw \
+    -v /home/ubuntu/simteleop/cache/ov:/root/.cache/ov:rw \
+    -v /home/ubuntu/simteleop/cache/pip:/root/.cache/pip:rw \
+    -v /home/ubuntu/simteleop/cache/glcache:/root/.cache/nvidia/GLCache:rw \
+    -v /home/ubuntu/simteleop/cache/computecache:/root/.nv/ComputeCache:rw \
+    -v "$WS/source:/workspace/Sim-to-Real-SO-101-Workshop/source" \
+    -v /home/ubuntu/simteleop/datasets:/workspace/datasets \
+    -v "$WS/docker/env:/root/env" \
+    "$IMG" \
+    python -m simteleop_sim.env_server --task "$TASK" --seed "$SEED" $HEADLESS_FLAG "${REC_ARGS[@]}" >/dev/null
+
+say "waiting for the env server (scene load + first reset takes 2-4 minutes; the first run compiles shaders and can take 10)"
+for i in $(seq 1 60); do
+    sleep 10
+    if docker logs simteleop_sim 2>&1 | grep -q '\[env_server\] ready'; then say "ready after $((i*10))s"; break; fi
+    if ! docker ps --format '{{.Names}}' | grep -qx simteleop_sim; then say "container exited:"; docker logs --tail 40 simteleop_sim; exit 1; fi
+done
+docker logs simteleop_sim 2>&1 | grep -E '\[env_server\] (cameras|ready|listening)' | tail -3
+exec simteleop-status

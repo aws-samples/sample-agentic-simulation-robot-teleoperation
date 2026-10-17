@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Upload a recorded dataset (LeRobot format, as written by the workshop recorder) and run logs.
+#   simteleop-publish agent_vials_to_rack [runs-dir]
+set -eo pipefail
+# shellcheck disable=SC1091
+. /etc/simteleop.env
+DS=${1:-agent_vials_to_rack}; RUNS=${2:-}
+SRC=/home/ubuntu/simteleop/datasets/$DS
+[ -d "$SRC" ] || { echo "no dataset at $SRC"; exit 2; }
+python3 - "$SRC" <<'PY'
+import json, sys, os
+root = sys.argv[1]
+info = os.path.join(root, "meta", "info.json")
+if os.path.exists(info):
+    i = json.load(open(info)); print(f"{root}: {i.get('total_episodes')} episodes, {i.get('total_frames')} frames, fps {i.get('fps')}, features {list(i.get('features', {}))}")
+else:
+    print(f"{root}: no meta/info.json yet (recorder still writing?)")
+PY
+STAMP=$(date +%Y%m%d-%H%M)
+aws s3 sync "$SRC" "s3://$SIMTELEOP_BUCKET/datasets/$DS/" --only-show-errors
+echo "UPLOADED s3://$SIMTELEOP_BUCKET/datasets/$DS/"
+if [ -n "$RUNS" ] && [ -d "$RUNS" ]; then
+    aws s3 sync "$RUNS" "s3://$SIMTELEOP_BUCKET/runs/$(basename "$RUNS")-$STAMP/" --only-show-errors
+    echo "UPLOADED s3://$SIMTELEOP_BUCKET/runs/$(basename "$RUNS")-$STAMP/"
+fi

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stop the simulator (asks the env server to flush pending episode writes first).
+set -eo pipefail
+python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",7010),timeout=3); s.sendall(b"{\"op\":\"shutdown\",\"id\":1}\n")' 2>/dev/null && sleep 15 || true
+docker rm -f simteleop_sim >/dev/null 2>&1 || true
+echo "simteleop_sim stopped"

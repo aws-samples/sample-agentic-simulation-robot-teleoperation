@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Liveness: container up, env server answering, what it holds.
+set -eo pipefail
+if ! docker ps --format '{{.Names}}' | grep -qx simteleop_sim; then echo "simteleop_sim: not running (simteleop-up)"; exit 1; fi
+echo "simteleop_sim: $(docker ps --filter name=simteleop_sim --format '{{.Status}}')"
+python3 - <<'PY'
+import json, socket
+try:
+    s = socket.create_connection(("127.0.0.1", 7010), timeout=3)
+    s.sendall(b'{"op":"ping","id":1}\n'); buf = b""
+    while b"\n" not in buf: buf += s.recv(65536)
+    r = json.loads(buf.split(b"\n")[0])["result"]
+    print(f"env server: task {r['task']}, step {r['step']}, busy {r['busy']}; {r['tool_axis']}")
+    s.sendall(b'{"op":"state","id":2}\n'); buf = b""
+    while b"\n" not in buf: buf += s.recv(65536)
+    st = json.loads(buf.split(b"\n")[0])["result"]
+    print(f"vials: {[(v['name'], 'rack' if v['in_rack'] else 'mat') for v in st['vials']]}; slots free {st['rack_slots_free']}")
+    print(f"recording: {st.get('recording')}")
+except Exception as e:
+    print(f"env server: NOT ANSWERING ({e}); docker logs --tail 30 simteleop_sim")
+    raise SystemExit(1)
+PY
